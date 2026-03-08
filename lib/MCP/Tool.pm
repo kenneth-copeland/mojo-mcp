@@ -29,6 +29,16 @@ sub call ($self, $args, $context) {
 
 sub context ($self) { $self->{context} || {} }
 
+sub notify ($self, $method, $params = {}, $context = undef) {
+  $context //= $self->{context} || {};
+  my $transport  = $context->{transport}  or return $self;
+  my $session_id = $context->{session_id} or return $self;
+  my $request_id = $context->{request_id};
+  my $c = $transport->stream_for($session_id, $request_id) or return $self;
+  $c->write_sse({text => to_json({jsonrpc => '2.0', method => $method, params => $params})});
+  return $self;
+}
+
 sub image_result ($self, $image, $options = {}, $is_error = 0) {
   return {
     content => [{

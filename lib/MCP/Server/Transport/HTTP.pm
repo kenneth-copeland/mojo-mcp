@@ -8,10 +8,29 @@ use Scalar::Util qw(blessed);
 
 use constant DEBUG => $ENV{MCP_DEBUG} || 0;
 
+# Stream registry: {session_id}{request_id} => controller
+has _streams => sub { {} };
+
 sub handle_request ($self, $c) {
   my $method = $c->req->method;
   return $self->_handle_post($c) if $method eq 'POST';
   return $c->render(json => {error => 'Method not allowed'}, status => 405);
+}
+
+sub stream_for ($self, $session_id, $request_id) {
+  return undef unless $session_id && defined $request_id;
+  return $self->_streams->{$session_id}{$request_id};
+}
+
+sub _register_stream ($self, $session_id, $request_id, $c) {
+  $self->_streams->{$session_id}{$request_id} = $c;
+}
+
+sub _deregister_stream ($self, $session_id, $request_id) {
+  delete $self->_streams->{$session_id}{$request_id} if $session_id && defined $request_id;
+  # Clean up empty session buckets
+  delete $self->_streams->{$session_id}
+    if $session_id && exists $self->_streams->{$session_id} && !%{$self->_streams->{$session_id}};
 }
 
 sub _extract_session_id ($self, $c) { return $c->req->headers->header('Mcp-Session-Id') }
@@ -43,17 +62,24 @@ sub _handle_post ($self, $c) {
 sub _handle_regular_request ($self, $c, $data, $session_id) {
   return $c->render(json => {error => 'Missing session ID'}, status => 400) unless $session_id;
 
+  my $request_id = $data->{id};
+  my $context    = {session_id => $session_id, request_id => $request_id, controller => $c, transport => $self};
+
   $c->res->headers->header('Mcp-Session-Id' => $session_id);
   return $c->render(data => '', status => 202)
-    unless defined(my $result = $self->_handle($data, {session_id => $session_id, controller => $c}));
+    unless defined(my $result = $self->_handle($data, $context));
 
   # Sync
   return $c->render(json => $result, status => 200) if !blessed($result) || !$result->isa('Mojo::Promise');
 
-  # Async
+  # Async — register stream, open SSE, deregister on completion
+  $self->_register_stream($session_id, $request_id, $c);
   $c->inactivity_timeout(0);
   $c->write_sse;
-  $result->then(sub { $c->write_sse({text => to_json($_[0])})->finish });
+  $result->then(sub {
+    $self->_deregister_stream($session_id, $request_id);
+    $c->write_sse({text => to_json($_[0])})->finish;
+  });
 }
 
 1;
